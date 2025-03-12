@@ -1,6 +1,5 @@
 import os
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Suppress oneDNN warnings (if you get any)
-
 import tensorflow as tf
 import numpy as np
 import yaml
@@ -12,7 +11,7 @@ from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-# The genomic features the script will extract from YAML file.
+# The genomic features that the script will extract from YAML file.
 selected_keys = [
     "breakpoint_width_target_Median",
     "aligned_gaps_target_Median",
