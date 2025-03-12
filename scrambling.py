@@ -1,16 +1,18 @@
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  #To suppress oneDNN warnings (if you get any)
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Suppress oneDNN warnings (if you get any)
+
 import tensorflow as tf
 import numpy as np
 import yaml
 import cv2
 import albumentations as A
 import matplotlib.pyplot as plt
+from tensorflow.keras import layers, models, regularizers  
+from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import confusion_matrix, classification_report, r2_score
 
-# The selected genomic features from the YAML file.
+# The genomic features the script will extract from YAML file.
 selected_keys = [
     "breakpoint_width_target_Median",
     "aligned_gaps_target_Median",
@@ -25,7 +27,7 @@ selected_keys = [
 def circular_shift(image, shift_range=(-50, 50)):
     """Performs a circular shift along the x-axis to simulate genome circular permutations."""
     shift = np.random.randint(shift_range[0], shift_range[1])
-    return np.roll(image, shift, axis=1)  # Shifts horizontally
+    return np.roll(image, shift, axis=1)  # Shift horizontally
 
 # Augmentation pipeline
 augmentor = A.Compose([
@@ -38,7 +40,7 @@ augmentor = A.Compose([
     A.ElasticTransform(alpha=1, sigma=50, p=0.3),
 ])
 
-# This snippet Loads and preprocess dot plot images
+# Load and preprocess dot plot images
 def load_image(image_path, target_size=(224, 224)):
     try:
         img = tf.keras.preprocessing.image.load_img(image_path, target_size=target_size)
@@ -130,7 +132,7 @@ def train_model(image_dir, yaml_dir, batch_size=16, epochs=10, target_size=(224,
         print("No data loaded. Check file paths.")
         return None
     
-    # Split the dataset
+    # Split dataset
     X_train_img, X_test_img, X_train_yaml, X_test_yaml, y_train, y_test = train_test_split(
         X_images, X_yaml, y, test_size=0.2, random_state=42, shuffle=True)
     
@@ -167,7 +169,7 @@ def train_model(image_dir, yaml_dir, batch_size=16, epochs=10, target_size=(224,
     
     return model, scaler, scaler_y, history
 
-# Paths (please edit them as you need)
+# Paths (Please change them as needed.)
 image_dir = r"C:\Users\admin\Desktop\CODE\dot_plots"
 yaml_dir = r"C:\Users\admin\Desktop\CODE\YAML files"
 
