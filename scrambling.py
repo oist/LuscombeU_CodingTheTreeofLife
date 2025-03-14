@@ -6,10 +6,11 @@ import yaml
 import cv2
 import albumentations as A
 import matplotlib.pyplot as plt
-from tensorflow.keras import layers, models, regularizers  
+from tensorflow.keras import layers, models, regularizers
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, classification_report, r2_score
 
 # The genomic features that the script will extract from YAML file.
 selected_keys = [
@@ -21,6 +22,9 @@ selected_keys = [
     "index_strandRand_target",
     "index_strandRand_query"
 ]
+
+# Define bins for label categorization
+bins = [0, 10, 20, 30] 
 
 # Circular shift function
 def circular_shift(image, shift_range=(-50, 50)):
@@ -72,45 +76,51 @@ def load_yaml_features(yaml_path):
         print(f"Error loading YAML {yaml_path}: {e}")
         return {key: 0 for key in selected_keys}
 
-# Load dataset
-def load_data(image_dir, yaml_dir, target_size=(224, 224)):
-    images, yaml_features_list, labels = [], [], []
-    target_key = "breakpoint_width_target_Median"
-    
-    print("Loading data...")
-    for image_filename in os.listdir(image_dir):
-        if image_filename.endswith(".o2o_plt.png"):
-            base_name = image_filename.replace(".o2o_plt.png", "")
-            yaml_filename = base_name + ".yaml"
-            image_path = os.path.join(image_dir, image_filename)
-            yaml_path = os.path.join(yaml_dir, yaml_filename)
+# Data Generator
+def data_generator(image_dir, yaml_dir, batch_size=32, target_size=(224, 224)):
+    image_filenames = [f for f in os.listdir(image_dir) if f.endswith(".o2o_plt.png")]
+    while True:
+        for i in range(0, len(image_filenames), batch_size):
+            batch_filenames = image_filenames[i:i + batch_size]
+            images, yaml_features, labels = [], [], []
+            for image_filename in batch_filenames:
+                base_name = image_filename.replace(".o2o_plt.png", "")
+                yaml_filename = base_name + ".yaml"
+                image_path = os.path.join(image_dir, image_filename)
+                yaml_path = os.path.join(yaml_dir, yaml_filename)
+                
+                if os.path.exists(yaml_path):
+                    image = load_image(image_path, target_size)
+                    features = load_yaml_features(yaml_path)
+                    if image is not None:
+                        images.append(image)
+                        yaml_features.append([features[key] for key in selected_keys])
+                        labels.append(features.get("breakpoint_width_target_Median", 0))
             
-            if os.path.exists(yaml_path):
-                image = load_image(image_path, target_size)
-                features = load_yaml_features(yaml_path)
-                if image is not None:
-                    images.append(image)
-                    yaml_features_list.append([features[key] for key in selected_keys])
-                    labels.append(features.get(target_key, 0))
-    
-    print(f"Loaded {len(images)} images and {len(yaml_features_list)} YAML entries.")
-    return np.array(images), np.array(yaml_features_list), np.array(labels)
+            if len(images) > 0:
+                # Convert labels to categorical using bins
+                binned_labels = np.digitize(labels, bins) - 1
+                one_hot_labels = tf.keras.utils.to_categorical(binned_labels, num_classes=len(bins) - 1)
+                
+                # Yield data as tuples, not lists
+                yield (
+                    (np.array(images, dtype=np.float32), np.array(yaml_features, dtype=np.float32)),
+                    (np.array(labels, dtype=np.float32), np.array(one_hot_labels, dtype=np.float32))
+                )
 
 # Define CNN + MLP model
-def create_model(input_image_shape=(224, 224, 3), input_yaml_shape=(None,)):
+def create_model(input_image_shape=(224, 224, 3), input_yaml_shape=(len(selected_keys),)):
     inputs_image = layers.Input(shape=input_image_shape)
     cnn_base = tf.keras.applications.ResNet50(include_top=False, input_tensor=inputs_image, weights='imagenet')
     cnn_out = layers.GlobalAveragePooling2D()(cnn_base.output)
     
     inputs_yaml = layers.Input(shape=input_yaml_shape)
-    x_yaml = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.1))(inputs_yaml)
+    x_yaml = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(0.1))(inputs_yaml)
     x_yaml = layers.Dropout(0.5)(x_yaml)
-    x_yaml = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(0.1))(x_yaml)
     
     combined = layers.concatenate([cnn_out, x_yaml])
-    x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.1))(combined)
+    x = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(0.1))(combined)
     x = layers.Dropout(0.5)(x)
-    x = layers.Dense(64, activation='relu', kernel_regularizer=regularizers.l2(0.1))(x)
     
     regression_output = layers.Dense(1, name='scrambling_regression')(x)
     classification_output = layers.Dense(3, activation='softmax', name='scrambling_classification')(x)
@@ -118,7 +128,7 @@ def create_model(input_image_shape=(224, 224, 3), input_yaml_shape=(None,)):
     model = models.Model(inputs=[inputs_image, inputs_yaml], outputs=[regression_output, classification_output])
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
-        loss={'scrambling_regression': 'huber', 'scrambling_classification': 'categorical_crossentropy'},  # Huber loss for regression
+        loss={'scrambling_regression': 'huber', 'scrambling_classification': 'categorical_crossentropy'},
         loss_weights={'scrambling_regression': 1.0, 'scrambling_classification': 0.5},
         metrics={'scrambling_regression': 'mae', 'scrambling_classification': 'accuracy'}
     )
@@ -126,54 +136,59 @@ def create_model(input_image_shape=(224, 224, 3), input_yaml_shape=(None,)):
 
 # Train model
 def train_model(image_dir, yaml_dir, batch_size=16, epochs=10, target_size=(224, 224)):
-    X_images, X_yaml, y = load_data(image_dir, yaml_dir, target_size)
-    if len(X_images) == 0:
-        print("No data loaded. Check file paths.")
-        return None
+    # Load data to determine the number of samples and split into train/validation
+    image_filenames = [f for f in os.listdir(image_dir) if f.endswith(".o2o_plt.png")]
+    train_filenames, val_filenames = train_test_split(image_filenames, test_size=0.2, random_state=42)
     
-    # Split dataset
-    X_train_img, X_test_img, X_train_yaml, X_test_yaml, y_train, y_test = train_test_split(
-        X_images, X_yaml, y, test_size=0.2, random_state=42, shuffle=True)
+    # Create data generators
+    train_generator = data_generator(image_dir, yaml_dir, batch_size=batch_size, target_size=target_size)
+    val_generator = data_generator(image_dir, yaml_dir, batch_size=batch_size, target_size=target_size)
     
-    # Scale YAML features
-    scaler = StandardScaler()
-    X_train_yaml = scaler.fit_transform(X_train_yaml)
-    X_test_yaml = scaler.transform(X_test_yaml)
+    # Define output_signature for the generator
+    output_signature = (
+        (
+            tf.TensorSpec(shape=(None, target_size[0], target_size[1], 3), dtype=tf.float32),  # Images
+            tf.TensorSpec(shape=(None, len(selected_keys)), dtype=tf.float32)  # YAML features
+        ),
+        (
+            tf.TensorSpec(shape=(None,), dtype=tf.float32),  # Regression labels
+            tf.TensorSpec(shape=(None, len(bins) - 1), dtype=tf.float32)  # Classification labels
+        )
+    )
     
-    # Scale regression targets
-    scaler_y = StandardScaler()
-    y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
-    y_test_scaled = scaler_y.transform(y_test.reshape(-1, 1)).flatten()
+    # Convert generators to tf.data.Dataset
+    train_dataset = tf.data.Dataset.from_generator(
+        lambda: train_generator,
+        output_signature=output_signature
+    ).prefetch(tf.data.AUTOTUNE)
     
-    # Categorize scrambling levels
-    bins = np.percentile(y_train, [33, 66])
-    y_train_class = np.digitize(y_train, bins) - 1
-    y_test_class = np.digitize(y_test, bins) - 1
-    y_train_class = tf.keras.utils.to_categorical(y_train_class, num_classes=3)
-    y_test_class = tf.keras.utils.to_categorical(y_test_class, num_classes=3)
+    val_dataset = tf.data.Dataset.from_generator(
+        lambda: val_generator,
+        output_signature=output_signature
+    ).prefetch(tf.data.AUTOTUNE)
     
     # Train the model
-    model = create_model(input_image_shape=(target_size[0], target_size[1], 3), input_yaml_shape=(X_yaml.shape[1],))
+    model = create_model(input_image_shape=(target_size[0], target_size[1], 3), input_yaml_shape=(len(selected_keys),))
     early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
     
     history = model.fit(
-        [X_train_img, X_train_yaml], 
-        {'scrambling_regression': y_train_scaled, 'scrambling_classification': y_train_class},
-        batch_size=batch_size, 
-        epochs=epochs, 
-        validation_split=0.2, 
+        train_dataset,
+        steps_per_epoch=len(train_filenames) // batch_size,
+        epochs=epochs,
+        validation_data=val_dataset,
+        validation_steps=len(val_filenames) // batch_size,
         callbacks=[early_stopping],
         verbose=2  # Cleaner output (one line per epoch)
     )
     
-    return model, scaler, scaler_y, history
+    return model, history
 
 # Paths (Please change them as needed.)
 image_dir = r"C:\Users\admin\Desktop\CODE\dot_plots"
 yaml_dir = r"C:\Users\admin\Desktop\CODE\YAML files"
 
 # Train and save model
-model, scaler, scaler_y, history = train_model(image_dir, yaml_dir)
+model, history = train_model(image_dir, yaml_dir)
 model.save('scrambling_model.keras')
 
 # Plot training history
@@ -197,7 +212,6 @@ def plot_history(history):
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
     plt.legend()
-    
     plt.show()
 
 # Plot training history
