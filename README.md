@@ -18,3 +18,5 @@ Features-
 *Custom Data Generator: Loads and preprocesses image and YAML feature data for training.
 *Scalable Training: Supports GPU acceleration with adjustable batch sizes and epochs.
 *Logging and Error Handling: Implements logging for better debugging and dataset validation.
+-Dependencies
+TensorFlow, NumPy, OpenCV, Albumentations, scikit-learn, Matplotlib, tqdm
