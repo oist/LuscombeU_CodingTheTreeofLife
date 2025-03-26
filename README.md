@@ -3,7 +3,9 @@ This repository contains a TensorFlow-based deep learning pipeline for recognizi
 
 Clade-Specific Patterns of Scrambling:
 Bacteria exhibit cross-like patterns of scrambling due to their tendency to preserve codirectionality between replication and transcription. This project addresses the following key questions:
+
 *Can we train an AI model to recognize this pattern, despite circular permutations and regardless of the extent of scrambling?
+
 *Can we quantify the extent of scrambling, while considering the preserved pattern?
 
 Classification Objective
