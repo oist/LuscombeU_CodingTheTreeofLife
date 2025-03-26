@@ -16,7 +16,9 @@ Features
 - Multi-Task Learning:
 
 *Regression Task: Predicts scrambling indices.
+
 *Classification Task: Categorizes scrambling severity.
+
 *Binary Classification: Detects cross-like scrambling patterns.
 
 - Data Augmentation: Utilizes Albumentations for random rotations, flips, and affine transformations.
