@@ -33,5 +33,7 @@ Dependencies
 TensorFlow, NumPy, OpenCV, Albumentations, scikit-learn, Matplotlib, tqdm
 
 ⚠Note: Running on a GPU is strongly recommended.
+
 -GPU Runtime: ~30 minutes to 1 hour.
+
 -CPU Runtime: Exceeds 4 hours due to large dataset size
