@@ -1,5 +1,5 @@
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'  # Enable CPU optimizations
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import tensorflow as tf
@@ -22,11 +22,30 @@ logger = logging.getLogger(__name__)
 
 # CONFIGURATION 
 EPOCHS = 20        # Number of training epochs(please increase them as needed, for running it on CPU I reduced it to 20, can be increased to 50 for running on GPU)
-BATCH_SIZE = 16  # Batch size (reduce if memory , and/or can be increased to 32, 64 if needed)
+BATCH_SIZE = 16     # Batch size (reduce if memory , and/or can be increased to 32, 64 if needed)
 PATIENCE = 5        # Early stopping patience    
 TARGET_SIZE = (224, 224)
 VISUALIZE_EXAMPLES = True
 EXAMPLES_TO_SHOW = 5 
+
+# GPU/CPU Conditional Setup
+if tf.config.list_physical_devices('GPU'):
+    # GPU-Specific Settings
+    BATCH_SIZE = 64  # Larger batches better utilize GPU parallelism
+    MIXED_PRECISION = True  # Enable for 2-3x speedup on supported GPUs
+    os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable CPU-specific optims
+else:
+    # CPU-Specific Settings
+    BATCH_SIZE = 8   # Smaller batches prevent memory thrashing
+    MIXED_PRECISION = False
+      # Set thread configuration for CPU optimization
+    tf.config.threading.set_intra_op_parallelism_threads(os.cpu_count())
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+
+# Enable mixed precision if GPU available and configured
+if MIXED_PRECISION:
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
 
 selected_keys = [
     "breakpoint_width_target_Median",
@@ -59,12 +78,20 @@ class DotPlotProcessor:
         self._fit_scaler = False
         
     def _build_augmentation_pipeline(self):
-        return A.Compose([
-            A.Rotate(limit=360, p=1.0),       # Random rotations
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.Affine(scale=(0.8, 1.2), p=0.5),
-        ])
+        # GPU OPTIMIZATION: Can add more intensive augmentations when using GPU
+        # CPU OPTIMIZATION: Simplified pipeline for faster processing
+        if tf.config.list_physical_devices('GPU'):
+            return A.Compose([
+                A.Rotate(limit=360, p=1.0),       # Random rotations
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Affine(scale=(0.8, 1.2), p=0.5),
+            ], p=1.0)
+        else:
+            return A.Compose([
+                A.HorizontalFlip(p=0.3),
+                A.VerticalFlip(p=0.3),
+            ], p=0.8)  # Apply only 80% of samples to reduce load
     
     def circular_shift(self, image, shift_range=(-50, 50)):
         shift = np.random.randint(shift_range[0], shift_range[1])
@@ -73,17 +100,28 @@ class DotPlotProcessor:
     def load_image(self, image_path):
         """This part Loads and preprocesses an image file"""
         try:
+            # GPU OPTIMIZATION: Can use TF-native augmentations on GPU
+            # CPU OPTIMIZATION: Albumentations + numpy is faster on CPU
             img = tf.io.read_file(image_path)
             img = tf.image.decode_png(img, channels=3)
             img = tf.image.resize(img, self.target_size)
             img = tf.cast(img, tf.float32) / 255.0
-            img_np = img.numpy()
             
-            # Apply augmentations
-            augmented = self.augmentor(image=img_np)['image']
-            img_tensor = tf.convert_to_tensor(augmented)
-            img_tensor = self.circular_shift(img_tensor)
-            return img_tensor
+            if tf.config.list_physical_devices('GPU'):
+                # GPU path - use TF ops
+                if tf.random.uniform(()) > 0.5:
+                    img = tf.image.flip_left_right(img)
+                if tf.random.uniform(()) > 0.5:
+                    img = tf.image.flip_up_down(img)
+                img = self.circular_shift(img)
+            else:
+                # CPU path - use Albumentations
+                img_np = img.numpy()
+                augmented = self.augmentor(image=img_np)['image']
+                img = tf.convert_to_tensor(augmented)
+                img = self.circular_shift(img)
+                
+            return img
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {e}")
             return None
@@ -95,10 +133,10 @@ class DotPlotProcessor:
             gray = tf.image.rgb_to_grayscale(image)
             gray_uint8 = tf.cast(gray * 255, tf.uint8).numpy()
             
-            # Edge detection
-            edges = cv2.Canny(gray_uint8, 50, 150)
+            # Edge detection with optimized parameters
+            edges = cv2.Canny(gray_uint8, 50, 150, L2gradient=True)
             
-            # Line detection
+            # Line detection with early exit conditions
             lines = cv2.HoughLinesP(edges, 1, np.pi/180, 
                                   threshold=50, 
                                   minLineLength=50, 
@@ -107,6 +145,9 @@ class DotPlotProcessor:
             if lines is not None:
                 lines = lines[:, 0]
                 n = len(lines)
+                if n > 20:  # Early exit for clearly cross patterns
+                    return 1
+                
                 intersections = 0
                 
                 # Count line intersections
@@ -117,6 +158,8 @@ class DotPlotProcessor:
                         denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
                         if denom != 0:
                             intersections += 1
+                            if intersections > 5:  # Early exit
+                                return 1
                 
                 # If many intersections, label as cross-like pattern
                 return 1 if intersections > 5 else 0
@@ -134,13 +177,13 @@ class DotPlotProcessor:
             return 0.0
     
     def load_yaml_features(self, yaml_path):
+        """Optimized YAML loading with direct iteration"""
         try:
             with open(yaml_path, 'r') as file:
-                lines = [line.strip() for line in file.readlines() 
-                        if line.strip() and line.strip() != "|"]
                 yaml_data = {}
-                for line in lines:
-                    if ":" in line:
+                for line in file:  # Direct iteration is faster than readlines()
+                    line = line.strip()
+                    if line and line != "|" and ":" in line:
                         key, value = line.split(":", 1)
                         key = key.strip()
                         value = value.strip()
@@ -150,7 +193,8 @@ class DotPlotProcessor:
                                   dtype=np.float32)
                 
                 if not self._fit_scaler:
-                    self.feature_scaler.fit(features.reshape(1, -1))
+                    # Using partial_fit for memory efficiency
+                    self.feature_scaler.partial_fit(features.reshape(1, -1))
                     self._fit_scaler = True
                 
                 return self.feature_scaler.transform(features.reshape(1, -1))[0]
@@ -161,7 +205,8 @@ class DotPlotProcessor:
     def scale_regression_targets(self, targets):
         """Scale regression targets using fitted scaler"""
         if not hasattr(self, 'reg_scaler_fitted'):
-            self.reg_scaler.fit(np.array(targets).reshape(-1, 1))
+            # Using partial_fit for memory efficiency
+            self.reg_scaler.partial_fit(np.array(targets).reshape(-1, 1))
             self.reg_scaler_fitted = True
         return self.reg_scaler.transform(np.array(targets).reshape(-1, 1))
 
@@ -180,17 +225,31 @@ class DotPlotDataGenerator(tf.keras.utils.Sequence):
         self.target_size = target_size
         self.shuffle = shuffle
         self.processor = DotPlotProcessor(target_size)
+        
+        # CPU OPTIMIZATION: Pre-load all YAML features to RAM
+        self._preload_features()
+        
+        # Initialize valid pairs
         self.image_files = file_list if file_list is not None else [
             f for f in os.listdir(image_dir) if f.endswith(".o2o_plt.png")]
         self.valid_pairs = []
         
-        for img_file in tqdm(self.image_files, desc="Validating files", leave=False):
+        for img_file in self.image_files:
             base = img_file.replace(".o2o_plt.png", "")
             yaml_file = f"{base}.yaml"
-            yaml_path = os.path.join(self.yaml_dir, yaml_file)
-            if os.path.exists(yaml_path):
+            if os.path.exists(os.path.join(self.yaml_dir, yaml_file)):
                 self.valid_pairs.append((img_file, yaml_file))
         self.on_epoch_end()
+    
+    def _preload_features(self):
+        """CPU OPTIMIZATION: Load all YAML features once to RAM"""
+        self.feature_cache = {}
+        for f in tqdm(os.listdir(self.yaml_dir), desc="Preloading features"):
+            if f.endswith('.yaml'):
+                base = f.split('.')[0]
+                features = self.processor.load_yaml_features(os.path.join(self.yaml_dir, f))
+                if features is not None:
+                    self.feature_cache[base] = features
     
     def __len__(self):
         return int(np.ceil(len(self.valid_pairs) / self.batch_size))
@@ -212,19 +271,21 @@ class DotPlotDataGenerator(tf.keras.utils.Sequence):
         
         for img_file, yaml_file in batch_pairs:
             img_path = os.path.join(self.image_dir, img_file)
-            yaml_path = os.path.join(self.yaml_dir, yaml_file)
-            
             image = self.processor.load_image(img_path)
-            features = self.processor.load_yaml_features(yaml_path)
+            
+            # Use preloaded features if available
+            base_name = yaml_file.split('.')[0]
+            features = self.feature_cache.get(base_name)
             
             if image is not None and features is not None:
                 try:
-                    yaml_data = {}
+                    # Get YAML data from preloaded features
+                    yaml_path = os.path.join(self.yaml_dir, yaml_file)
                     with open(yaml_path, 'r') as f:
-                        lines = [line.strip() for line in f.readlines() 
-                                if line.strip() and line.strip() != "|"]
-                        for line in lines:
-                            if ":" in line:
+                        yaml_data = {}
+                        for line in f:
+                            line = line.strip()
+                            if line and line != "|" and ":" in line:
                                 key, value = line.split(":", 1)
                                 key = key.strip()
                                 value = value.strip()
@@ -236,7 +297,13 @@ class DotPlotDataGenerator(tf.keras.utils.Sequence):
                         bin_idx, 
                         num_classes=len(bins["breakpoint_width_target_Median"]) - 1
                     )
-                    pattern_label = self.processor.weak_label_cross_linear(image)
+                    
+                    # CPU OPTIMIZATION: Only compute patterns during final evaluation
+                    if tf.config.list_physical_devices('GPU') or not self.shuffle:
+                        pattern_label = self.processor.weak_label_cross_linear(image)
+                    else:
+                        pattern_label = 0  # Dummy during training
+                        
                     pattern_target = tf.keras.utils.to_categorical(pattern_label, num_classes=2)
                     
                     batch_images.append(image)
@@ -251,9 +318,10 @@ class DotPlotDataGenerator(tf.keras.utils.Sequence):
         if not batch_images:
             return self.__getitem__(np.random.randint(0, self.__len__()))
         
-        # Scale regression targets
+        # Scale regression targets in batch for efficiency
         batch_regression = self.processor.scale_regression_targets(batch_regression)
         
+        # Convert to tensors in single operations
         batch_images = tf.stack(batch_images)
         batch_features = tf.convert_to_tensor(batch_features, dtype=tf.float32)
         batch_regression = tf.convert_to_tensor(batch_regression, dtype=tf.float32)
@@ -268,15 +336,29 @@ class DotPlotDataGenerator(tf.keras.utils.Sequence):
                 'pattern_classification': batch_patterns
             }
         )
+
 # MODEL ARCHITECTURE 
 def create_optimized_model(input_image_shape=TARGET_SIZE + (3,), input_features_shape=(len(selected_keys),)):
     input_image = layers.Input(shape=input_image_shape, name='input_image')
-    base_model = tf.keras.applications.ResNet50(
-        include_top=False,
-        input_tensor=input_image,
-        weights='imagenet',
-        pooling='avg'
-    )
+    
+    # GPU OPTIMIZATION: Use ResNet50 when GPU available
+    # CPU OPTIMIZATION: Use MobileNetV2 for faster CPU processing
+    if tf.config.list_physical_devices('GPU'):
+        base_model = tf.keras.applications.ResNet50(
+            include_top=False,
+            input_tensor=input_image,
+            weights='imagenet',
+            pooling='avg'
+        )
+    else:
+         base_model = tf.keras.applications.MobileNetV2(
+            input_shape=(224, 224, 3),  # Explicit shape definition
+            include_top=False,
+            input_tensor=input_image,
+            weights='imagenet',
+            pooling='avg'
+        )
+    
     base_model.trainable = True
     
     input_features = layers.Input(shape=input_features_shape, name='input_features')
@@ -286,14 +368,24 @@ def create_optimized_model(input_image_shape=TARGET_SIZE + (3,), input_features_
     
     combined = layers.concatenate([base_model.output, x_features])
     
-    # Enhanced model capacity
-    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.01))(combined)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
-    
-    x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x)
+    # GPU OPTIMIZATION: Can use larger layers
+    # CPU OPTIMIZATION: Use smaller layers
+    if tf.config.list_physical_devices('GPU'):
+        x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.01))(combined)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.5)(x)
+        
+        x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.5)(x)
+    else:
+        x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(combined)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.4)(x)
+        
+        x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.4)(x)
     
     regression_output = layers.Dense(1, name='scrambling_regression')(x)
     classification_output = layers.Dense(
@@ -308,11 +400,11 @@ def create_optimized_model(input_image_shape=TARGET_SIZE + (3,), input_features_
         outputs=[regression_output, classification_output, pattern_output]
     )
     
-    # Enhanced optimizer with learning rate decay
+    # Enhanced optimizer with adjusted learning rate decay
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
         initial_learning_rate=0.001,
-        decay_steps=1000,
-        decay_rate=0.9)
+        decay_steps=10000,  # Reduced frequency of decay
+        decay_rate=0.96)    # Slower decay rate
     
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     
@@ -337,13 +429,17 @@ def create_optimized_model(input_image_shape=TARGET_SIZE + (3,), input_features_
     
     return model
 
-#  TRAINING
+# TRAINING
 def train_model(image_dir, yaml_dir):
     all_files = [f for f in os.listdir(image_dir) if f.endswith(".o2o_plt.png")]
     train_files, val_files = train_test_split(all_files, test_size=0.2, random_state=42)
     
+    # GPU OPTIMIZATION: Larger validation batch
+    val_batch_size = 64 if tf.config.list_physical_devices('GPU') else 8
+    
     train_gen = DotPlotDataGenerator(image_dir, yaml_dir, file_list=train_files)
-    val_gen = DotPlotDataGenerator(image_dir, yaml_dir, file_list=val_files, shuffle=False)
+    val_gen = DotPlotDataGenerator(image_dir, yaml_dir, file_list=val_files, 
+                                 shuffle=False, batch_size=val_batch_size)
     
     model = create_optimized_model()
     
@@ -380,6 +476,7 @@ def train_model(image_dir, yaml_dir):
     tqdm.__init__ = partial(tqdm.__init__, disable=True)
     
     print("\nPreparing data...")
+
     history = model.fit(
         train_gen,
         validation_data=val_gen,
@@ -509,9 +606,7 @@ def classify_plots(model, image_dir, yaml_dir):
 
 # MAIN EXECUTION 
 if __name__ == "__main__":
-
     # Paths (Please change them as needed.)
-
     image_dir = r"C:\Users\admin\Desktop\CODE\Halobacteria\dot plots"
     yaml_dir = r"C:\Users\admin\Desktop\CODE\Halobacteria\YAML Files"
     
