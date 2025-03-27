@@ -145,6 +145,11 @@ class DotPlotProcessor:
             if lines is not None:
                 lines = lines[:, 0]
                 n = len(lines)
+                
+                # Return 2 for sparse/no patterns if fewer than 5 lines
+                if n < 5:  # Changed threshold
+                    return 2  # New "other" category
+                
                 if n > 20:  # Early exit for clearly cross patterns
                     return 1
                 
@@ -163,11 +168,13 @@ class DotPlotProcessor:
                 
                 # If many intersections, label as cross-like pattern
                 return 1 if intersections > 5 else 0
-            return 0
+            
+            # Return 2 for no detectable patterns
+            return 2  # Changed from 0 to 2
         except Exception as e:
             logger.error(f"Error in weak labeling: {e}")
-            return 0
-    
+            return 2  # Changed from 0 to 2
+
     def safe_float_convert(self, value):
         try:
             if not value or value.lower() in ['na', '.na', 'nan', 'none', 'null']:
@@ -304,7 +311,7 @@ class DotPlotDataGenerator(tf.keras.utils.Sequence):
                     else:
                         pattern_label = 0  # Dummy during training
                         
-                    pattern_target = tf.keras.utils.to_categorical(pattern_label, num_classes=2)
+                    pattern_target = tf.keras.utils.to_categorical(pattern_label, num_classes=3)
                     
                     batch_images.append(image)
                     batch_features.append(features)
@@ -393,7 +400,7 @@ def create_optimized_model(input_image_shape=TARGET_SIZE + (3,), input_features_
         activation='softmax',
         name='scrambling_classification'
     )(x)
-    pattern_output = layers.Dense(2, activation='softmax', name='pattern_classification')(x)
+    pattern_output = layers.Dense(3, activation='softmax', name='pattern_classification')(x)
     
     model = models.Model(
         inputs=[input_image, input_features],
@@ -548,6 +555,10 @@ def visualize_examples(image_dir, linear_files, cross_files):
     print(f"\nCross Scrambling Examples ({len(cross_files)} total):")
     for img_file in random.sample(cross_files, min(EXAMPLES_TO_SHOW, len(cross_files))):
         load_and_show(os.path.join(image_dir, img_file), "Cross Scrambling")
+    # Show other pattern examples (ADD THIS BLOCK)
+    print(f"\nOther Pattern Examples ({len(other_files)} total):")
+    for img_file in random.sample(other_files, min(EXAMPLES_TO_SHOW, len(other_files))):
+        load_and_show(os.path.join(image_dir, img_file), "Other Pattern")
 
 # CLASSIFICATION 
 def classify_plots(model, image_dir, yaml_dir):
@@ -556,6 +567,7 @@ def classify_plots(model, image_dir, yaml_dir):
     
     linear_files = []
     cross_files = []
+    other_files = []
     
     print("\nClassifying plots...")
     for img_file in tqdm(image_files, desc="Processing plots"):
@@ -580,8 +592,10 @@ def classify_plots(model, image_dir, yaml_dir):
             
             if pattern_class == 0:
                 linear_files.append(img_file)
-            else:
+            elif pattern_class == 1:
                 cross_files.append(img_file)
+            else:  # Handle other patterns
+                other_files.append(img_file)
                 
         except Exception as e:
             logger.error(f"Error processing {img_file}: {e}")
@@ -592,17 +606,20 @@ def classify_plots(model, image_dir, yaml_dir):
         f.write('\n'.join(linear_files))
     with open('cross_plots.txt', 'w') as f:
         f.write('\n'.join(cross_files))
+    with open('other_plots.txt', 'w') as f:  
+        f.write('\n'.join(other_files))
     
     # Print summary
-    total = len(linear_files) + len(cross_files)
+    total = len(linear_files) + len(cross_files) + len(other_files)
     print(f"\nClassification Results:")
     print(f"Linear scrambling plots: {len(linear_files)} ({len(linear_files)/total:.1%})")
     print(f"Cross scrambling plots: {len(cross_files)} ({len(cross_files)/total:.1%})")
+    print(f"Other patterns: {len(other_files)} ({len(other_files)/total:.1%})")
     print(f"\nResults saved to linear_plots.txt and cross_plots.txt")
     
     # Visualize examples if enabled
     if VISUALIZE_EXAMPLES and total > 0:
-        visualize_examples(image_dir, linear_files, cross_files)
+        visualize_examples(image_dir, linear_files, cross_files, other_files)
 
 # MAIN EXECUTION 
 if __name__ == "__main__":
