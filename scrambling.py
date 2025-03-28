@@ -450,14 +450,17 @@ def train_model(image_dir, yaml_dir):
     
     model = create_optimized_model()
     
+    # Attach processor to model before training starts
+    model.processor = train_gen.processor
+    
     class CleanTrainingCallback(tf.keras.callbacks.Callback):
         def on_train_begin(self, logs=None):
             print("\nTraining started - 1 line per epoch")
             
         def on_epoch_end(self, epoch, logs=None):
             # Inverse scale regression metrics for reporting
-            mae = model.processor.inverse_scale_regression([logs['scrambling_regression_mae']])[0][0]
-            val_mae = model.processor.inverse_scale_regression([logs['val_scrambling_regression_mae']])[0][0]
+            mae = self.model.processor.inverse_scale_regression([logs['scrambling_regression_mae']])[0][0]
+            val_mae = self.model.processor.inverse_scale_regression([logs['val_scrambling_regression_mae']])[0][0]
             
             print(f"Epoch {epoch+1}/{EPOCHS}: "
                   f"Loss {logs['loss']:.3f}/{logs['val_loss']:.3f} (train/val) | "
@@ -493,9 +496,6 @@ def train_model(image_dir, yaml_dir):
     )
     
     tqdm.__init__ = partial(tqdm.__init__, disable=False)
-    
-    # Attach processor to model for later use
-    model.processor = train_gen.processor
     
     return model, history
 
