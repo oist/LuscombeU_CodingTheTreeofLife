@@ -12,6 +12,7 @@ Classification Objective
 The model classifies input dot plots into:
 - Linearly scrambled
 - Cross-scrambled
+- Plots that are neither cross scrambeled nor linearly scrambled.
 
 Features
 - Deep Learning Model: Uses a ResNet50 backbone with additional fully connected layers.
